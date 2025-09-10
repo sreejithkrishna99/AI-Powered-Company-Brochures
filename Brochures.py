@@ -1,128 +1,141 @@
 import os
 import requests
+import json
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import openai
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-from reportlab.lib.units import inch
 
-# ================================
-# LOAD ENV & SET OPENAI KEY
-# ================================
-load_dotenv()
+# ==============================
+# Load API Key
+# ==============================
+load_dotenv(override=True)
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ================================
-# SCRAPE COMPANY WEBSITE
-# ================================
-def scrape_company_info(website):
-    """Extracts company info from the provided website."""
-    try:
-        response = requests.get(website, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+if not openai.api_key:
+    raise ValueError("❌ OpenAI API key not found. Please add it to your .env file.")
 
-        # Extract basic text content
-        paragraphs = [p.get_text() for p in soup.find_all("p")]
-        company_info = " ".join(paragraphs[:10])  # Limit to first 10 paragraphs
-        return company_info.strip()
-    except Exception as e:
-        print(f"⚠️ Error scraping website: {e}")
-        return ""
+# Model
+MODEL = "gpt-3.5-turbo"
 
-# ================================
-# GENERATE BROCHURE CONTENT (GPT)
-# ================================
-def generate_brochure_content(company_name, website, extracted_info):
-    """Uses OpenAI GPT to create brochure content."""
-    prompt = f"""
-    Create a professional company brochure content for:
+# Headers for web scraping
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/117.0.0.0 Safari/537.36"
+}
 
-    Company Name: {company_name}
-    Website: {website}
+# ==============================
+# Website Scraper
+# ==============================
+class Website:
+    def __init__(self, url):
+        self.url = url
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"⚠️ Failed to fetch {url}: {e}")
+            self.body, self.text, self.title, self.links = "", "", "", []
+            return
 
-    About the company:
-    {extracted_info}
+        soup = BeautifulSoup(response.content, "html.parser")
+        self.title = soup.title.string if soup.title else "No title found"
 
-    Please include:
-    - A compelling company overview
-    - Products/Services offered
-    - Key achievements
-    - Mission & Vision
-    - Why clients, investors, and recruits should choose this company
-    Make it engaging and professional.
-    """
+        if soup.body:
+            for irrelevant in soup.body(["script", "style", "img", "input"]):
+                irrelevant.decompose()
+            self.text = soup.body.get_text(separator="\n", strip=True)
+        else:
+            self.text = ""
 
+        self.links = [link.get("href") for link in soup.find_all("a") if link.get("href")]
+
+    def get_contents(self):
+        return f"Webpage Title:\n{self.title}\nContents:\n{self.text}\n\n"
+
+# ==============================
+# Get Relevant Links
+# ==============================
+link_system_prompt = """
+You are provided with a list of links found on a webpage.
+Select which links are most relevant for a company brochure:
+About, Products, Services, Careers, Contact.
+Respond in JSON like this:
+{
+    "links": [
+        {"type": "about page", "url": "https://example.com/about"},
+        {"type": "careers page", "url": "https://example.com/careers"}
+    ]
+}
+"""
+
+def get_links_user_prompt(website):
+    user_prompt = f"Here is the list of links on {website.url}.\n"
+    user_prompt += "Select relevant links for a brochure. Respond ONLY in JSON.\n"
+    user_prompt += "\n".join(website.links)
+    return user_prompt
+
+def get_links(url):
+    website = Website(url)
     response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
+        model=MODEL,
         messages=[
-            {"role": "system", "content": "You are an expert business copywriter."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        max_tokens=800
+            {"role": "system", "content": link_system_prompt},
+            {"role": "user", "content": get_links_user_prompt(website)}
+        ]
     )
+    content = response.choices[0].message["content"]
+    return json.loads(content)
 
-    return response["choices"][0]["message"]["content"]
+# ==============================
+# Fetch All Details
+# ==============================
+def get_all_details(url):
+    result = Website(url).get_contents()
+    links = get_links(url)
+    print("🔗 Found relevant links:", links)
 
-# ================================
-# CREATE PDF BROCHURE
-# ================================
-def create_brochure_pdf(company_name, content):
-    """Generates a professional brochure PDF."""
-    filename = f"{company_name}_Brochure.pdf"
-    pdf = canvas.Canvas(filename, pagesize=A4)
-    width, height = A4
+    for link in links.get("links", []):
+        result += f"\n\n{link['type']}\n"
+        result += Website(link["url"]).get_contents()
+    return result
 
-    # Title
-    pdf.setFont("Helvetica-Bold", 20)
-    pdf.setFillColor(colors.HexColor("#2E86C1"))
-    pdf.drawCentredString(width / 2, height - 80, f"{company_name} - Company Brochure")
+# ==============================
+# Build Brochure Prompt
+# ==============================
+system_prompt = """
+You are an assistant that creates a short, professional company brochure.
+Highlight overview, products, services, culture, achievements, customers, careers.
+Respond in Markdown.
+"""
 
-    # Body Text
-    pdf.setFillColor(colors.black)
-    pdf.setFont("Helvetica", 11)
+def get_brochure_user_prompt(company_name, url):
+    user_prompt = f"Company: {company_name}\n"
+    user_prompt += "Contents from relevant pages:\n"
+    user_prompt += get_all_details(url)
+    return user_prompt[:5000]  # truncate to avoid token limit
 
-    # Wrap long text into multiple lines
-    text_object = pdf.beginText(50, height - 120)
-    text_object.setFont("Helvetica", 11)
-    for line in content.split("\n"):
-        text_object.textLine(line.strip())
-        text_object.textLine("")  # Add spacing
+# ==============================
+# Create Brochure
+# ==============================
+def create_brochure(company_name, url):
+    response = openai.ChatCompletion.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": get_brochure_user_prompt(company_name, url)}
+        ]
+    )
+    brochure_text = response.choices[0].message["content"]
+    filename = f"{company_name}_brochure.md"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(brochure_text)
+    print(f"✅ Brochure created: {filename}")
 
-    pdf.drawText(text_object)
-
-    # Footer
-    pdf.setFont("Helvetica-Oblique", 9)
-    pdf.setFillColor(colors.grey)
-    pdf.drawCentredString(width / 2, 40, "Generated by AI Brochure Builder")
-
-    pdf.save()
-    return filename
-
-# ================================
-# MAIN FUNCTION
-# ================================
-def main():
-    print("=== Company Brochure Builder ===")
-    company_name = input("Enter company name: ").strip()
-    website = input("Enter company website (e.g. https://example.com): ").strip()
-
-    print("\n🔍 Scraping company information...")
-    extracted_info = scrape_company_info(website)
-
-    print("🤖 Generating brochure content using OpenAI GPT...")
-    content = generate_brochure_content(company_name, website, extracted_info)
-
-    print("📄 Creating brochure PDF...")
-    filename = create_brochure_pdf(company_name, content)
-
-    print(f"✅ Brochure created successfully: {filename}")
-
-# ================================
-# RUN THE SCRIPT
-# ================================
+# ==============================
+# Main
+# ==============================
 if __name__ == "__main__":
-    main()
+    company_name = input("Enter company name: ").strip()
+    website = input("Enter company website (https://...): ").strip()
+    create_brochure(company_name, website)
